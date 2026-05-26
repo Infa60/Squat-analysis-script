@@ -1,11 +1,12 @@
 """
 =========================================================================================
-SYNCHRONIZE VIDS & PLOT FRONTAL KNEE ANGLE - G/D & CORRÉLATION CLINIQUE (GEE)
+SYNCHRONIZE VIDS & PLOT FRONTAL KNEE ANGLE - G/D & CORRÉLATION CLINIQUE (LMM / GEE)
 =========================================================================================
 Objectif: Fusionner les données, extraire les angles frontaux au moment du pic sagittal.
-          1. Graphes Boxplots Gauche vs Droite avec statistiques intra-groupes (GEE).
-          2. Analyse GEE de corrélation (Angle Affecté Droit vs Clinique Droit).
-          3. Export Excel + Génération de Graphiques pour les corrélations significatives.
+          1. Graphes Boxplots Gauche vs Droite avec statistiques intra-groupes (Modèles Mixtes).
+          2. Analyse de corrélation (Angle Affecté Droit vs Clinique Droit).
+          3. Comparaison Hémiplégiques vs Diplégiques (LMM).
+          4. Export Excel + Génération de Graphiques.
 =========================================================================================
 """
 
@@ -23,6 +24,11 @@ import scipy.stats as stats
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.genmod.cov_struct import Exchangeable
+import warnings
+
+# Ignorer les petits avertissements de convergence pour garder la console propre
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+warnings.simplefilter('ignore', ConvergenceWarning)
 
 # --- CONFIGURATION DES CHEMINS ---
 main_path = r"C:\Users\bourgema\OneDrive - Université de Genève\PHD\Part1"
@@ -33,7 +39,7 @@ pkl_frontal_path = os.path.join(main_path, "Data", "Master_Database_Patient_Fron
 output_results_folder = os.path.join(main_path, "Results")
 plots_correlations_folder = os.path.join(output_results_folder, "Significant_Correlations_Plots")
 os.makedirs(output_results_folder, exist_ok=True)
-os.makedirs(plots_correlations_folder, exist_ok=True) # Dossier pour les plots significatifs
+os.makedirs(plots_correlations_folder, exist_ok=True)
 
 CUTOFF_FREQ = 3
 
@@ -138,6 +144,7 @@ for idx, row in master_combined.iterrows():
         trials_data.append({
             'Patient_Trial': row['File_Sagittal'],
             'ID_Patient': str(row['File_Sagittal']).split('_')[0],
+            'ID_Visite': str(row['File_Sagittal']).split('_')[1],
             'Diagnostic_Detail': diag_detail,
             'Diagnostic_Global': diag_global,
             'Angle_Gauche': angle_gauche,
@@ -155,8 +162,9 @@ clinical_cols = [c for c in master_combined.columns if c.startswith(('Force_', '
 df_wide = pd.merge(df_wide, master_combined[['File_Sagittal'] + clinical_cols], left_on='Patient_Trial', right_on='File_Sagittal', how='left')
 
 # Transformation en format long pour le Graphique Gauche/Droite
+# AJOUT DE 'ID_Visite' dans les id_vars
 df_long = df_wide.melt(
-    id_vars=['Patient_Trial', 'ID_Patient', 'Diagnostic_Detail', 'Diagnostic_Global'],
+    id_vars=['Patient_Trial', 'ID_Patient', 'ID_Visite', 'Diagnostic_Detail', 'Diagnostic_Global'],
     value_vars=['Angle_Gauche', 'Angle_Droit'],
     var_name='Jambe', value_name='Angle_Frontal'
 )
@@ -167,80 +175,78 @@ ordre_diag = [d for d in ordre_diag if d in df_wide['Diagnostic_Detail'].unique(
 
 
 # ==============================================================================
-# 4. ANALYSE DE CORRÉLATION CLINIQUE (GEE) ET EXPORT DES GRAPHIQUES
+# 4. ANALYSE DE CORRÉLATION CLINIQUE (LMM) ET EXPORT DES GRAPHIQUES
 # ==============================================================================
 print("\n" + "="*75)
-print(" 📊 CORRÉLATIONS : ANGLE AFFECTÉ vs EXAMEN CLINIQUE (GEE)")
+print(" 📊 CORRÉLATIONS : ANGLE AFFECTÉ vs EXAMEN CLINIQUE (LMM)")
 print("="*75)
 
 results_corr = []
-
-# Style pour les scatter plots sauvegardés
 sns.set_theme(style="ticks")
 
 for var in clinical_cols:
-    valid_df = df_wide.dropna(subset=[var, 'Angle_Affecte', 'ID_Patient']).copy()
+    valid_df = df_wide.dropna(subset=[var, 'Angle_Affecte', 'ID_Patient', 'ID_Visite']).copy()
     n_patients = valid_df['ID_Patient'].nunique()
 
     if n_patients >= 3:
         try:
-            cov_struct = Exchangeable()
-            md = smf.gee(f"Angle_Affecte ~ Q('{var}')", groups="ID_Patient", data=valid_df, family=sm.families.Gaussian(), cov_struct=cov_struct)
+            # Essai avec le Modèle Linéaire Mixte (Patient -> Visite)
+            md = smf.mixedlm(f"Angle_Affecte ~ Q('{var}')", data=valid_df, groups=valid_df["ID_Patient"], vc_formula={"Visite": "0 + C(ID_Visite)"})
             mdf = md.fit()
-
             pval = mdf.pvalues[f"Q('{var}')"]
             coef = mdf.params[f"Q('{var}')"]
+            model_used = "LMM"
 
-            results_corr.append({
-                'Variable_Clinique': var,
-                'Coefficient_Relation': coef,
-                'p-value_GEE': pval,
-                'Significatif': '*' if pval < 0.05 else '',
-                'N_Patients': n_patients,
-                'N_Essais': len(valid_df)
-            })
+        except Exception:
+            try:
+                # Fallback sur GEE classique si LMM ne converge pas
+                md = smf.gee(f"Angle_Affecte ~ Q('{var}')", groups="ID_Patient", data=valid_df, family=sm.families.Gaussian(), cov_struct=Exchangeable())
+                mdf = md.fit()
+                pval = mdf.pvalues[f"Q('{var}')"]
+                coef = mdf.params[f"Q('{var}')"]
+                model_used = "GEE (Fallback)"
+            except:
+                continue
 
-            # --- GÉNÉRATION DU PLOT SI SIGNIFICATIF (p < 0.05) ---
-            if pval < 0.05:
-                plt.figure(figsize=(8, 6))
-                sns.regplot(data=valid_df, x=var, y='Angle_Affecte',
-                            scatter_kws={'alpha':0.6, 'color': '#1f77b4', 'edgecolor': 'k'},
-                            line_kws={'color':'darkred', 'linewidth': 2})
+        results_corr.append({
+            'Variable_Clinique': var,
+            'Coefficient_Relation': coef,
+            'p-value': pval,
+            'Significatif': '*' if pval < 0.05 else '',
+            'Modele': model_used,
+            'N_Patients': n_patients,
+            'N_Essais': len(valid_df)
+        })
 
-                plt.title(f"Corrélation: Angle Valgus/Varus vs {var}\nGEE p-value = {pval:.4f} | Coef = {coef:.3f}", fontsize=12, fontweight='bold')
-                plt.xlabel(f"Score Clinique : {var}", fontsize=11, fontweight='bold')
-                plt.ylabel("Angle Frontal (Degrés)\n[Varus < 0 < Valgus]", fontsize=11, fontweight='bold')
-                plt.axhline(0, color='gray', linestyle='--', alpha=0.5) # Ligne du 0°
+        # --- GÉNÉRATION DU PLOT SI SIGNIFICATIF ---
+        if pval < 0.05:
+            plt.figure(figsize=(8, 6))
+            sns.regplot(data=valid_df, x=var, y='Angle_Affecte', scatter_kws={'alpha':0.6, 'color': '#1f77b4', 'edgecolor': 'k'}, line_kws={'color':'darkred', 'linewidth': 2})
+            plt.title(f"Corrélation: Angle Valgus/Varus vs {var}\n{model_used} p-value = {pval:.4f} | Coef = {coef:.3f}", fontsize=12, fontweight='bold')
+            plt.xlabel(f"Score Clinique : {var}", fontsize=11, fontweight='bold')
+            plt.ylabel("Angle Frontal (Degrés)\n[Varus < 0 < Valgus]", fontsize=11, fontweight='bold')
+            plt.axhline(0, color='gray', linestyle='--', alpha=0.5)
 
-                # Sauvegarde de l'image (Nom sécurisé pour éviter les erreurs Windows)
-                safe_var_name = str(var).replace('/', '_').replace('\\', '_').replace(' ', '_')
-                plot_path = os.path.join(plots_correlations_folder, f"Corr_{safe_var_name}.png")
-                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-                plt.close() # On ferme pour ne pas surcharger la mémoire
-
-        except Exception as e:
-            pass
+            safe_var_name = str(var).replace('/', '_').replace('\\', '_').replace(' ', '_')
+            plot_path = os.path.join(plots_correlations_folder, f"Corr_{safe_var_name}.png")
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
 
 df_corr = pd.DataFrame(results_corr)
 if not df_corr.empty:
-    df_corr = df_corr.sort_values('p-value_GEE')
+    df_corr = df_corr.sort_values('p-value')
     excel_export_path = os.path.join(output_results_folder, "Correlations_Angle_Frontal_vs_Clinique.xlsx")
     df_corr.to_excel(excel_export_path, index=False)
-
-    print(f"✅ Tableau des corrélations généré avec succès : {len(df_corr)} variables testées.")
-    print(f"📁 Fichier sauvegardé sous : {plots_correlations_folder}")
-    print(f"🖼️ Graphiques des corrélations significatives enregistrés dans : \n   -> {plots_correlations_folder}")
-    print("\nTop 5 des variables cliniques les plus corrélées à l'Angle Frontal (Valgus/Varus) :")
-    print(df_corr.head(5)[['Variable_Clinique', 'Coefficient_Relation', 'p-value_GEE', 'Significatif']].to_string(index=False))
+    print(f"✅ Tableau des corrélations généré avec succès.")
+    print(f"🖼️ Graphiques significatifs enregistrés dans : \n   -> {plots_correlations_folder}")
 else:
     print("⚠️ Aucune corrélation n'a pu être calculée.")
-print("="*75 + "\n")
 
 
 # ==============================================================================
-# 5. GRAPHIQUE : BOXPLOTS GAUCHE vs DROITE (AVEC GEE INTRA-GROUPE)
+# 5. GRAPHIQUE 1 : BOXPLOTS GAUCHE vs DROITE
 # ==============================================================================
-print("3. Génération de la Fenêtre (Comparaison Gauche/Droite)...")
+print("\n3. Génération de la Fenêtre (Comparaison Gauche/Droite)...")
 sns.set_theme(style="whitegrid")
 fig1, ax1 = plt.subplots(figsize=(12, 7))
 fig1.canvas.manager.set_window_title('Comparaison : Jambe Gauche vs Jambe Droite')
@@ -252,11 +258,10 @@ ymin, ymax = ax1.get_ylim()
 y_range = ymax - ymin
 
 for i, diag in enumerate(ordre_diag):
-    df_diag = df_long[df_long['Diagnostic_Detail'] == diag].copy()
+    df_diag = df_long[df_long['Diagnostic_Detail'] == diag].dropna(subset=['Angle_Frontal', 'ID_Patient', 'ID_Visite']).copy()
     if df_diag['Jambe'].nunique() == 2 and df_diag['ID_Patient'].nunique() > 2:
         try:
-            cov_struct = Exchangeable()
-            md = smf.gee("Angle_Frontal ~ C(Jambe)", groups="ID_Patient", data=df_diag, family=sm.families.Gaussian(), cov_struct=cov_struct)
+            md = smf.mixedlm("Angle_Frontal ~ C(Jambe)", data=df_diag, groups=df_diag["ID_Patient"], vc_formula={"Visite": "0 + C(ID_Visite)"})
             mdf = md.fit()
             p_keys = [k for k in mdf.pvalues.index if 'Jambe' in k]
 
@@ -268,7 +273,8 @@ for i, diag in enumerate(ordre_diag):
                 h = y_range * 0.02
                 ax1.plot([x1, x1, x2, x2], [y_bar, y_bar+h, y_bar+h, y_bar], lw=1.5, c='black')
                 ax1.text((x1+x2)*.5, y_bar+h, sig, ha='center', va='bottom', color='black', fontweight='bold', fontsize=12)
-        except: pass
+        except:
+            pass # Si le modèle mixte ne converge pas pour ce sous-groupe, on saute l'affichage de l'étoile
 
 ax1.set_ylim(ymin, ymax + y_range * 0.15)
 ymin, ymax = ax1.get_ylim()
@@ -284,13 +290,101 @@ handles, labels = ax1.get_legend_handles_labels()
 if len(handles) >= 2: ax1.legend(handles[0:2], labels[0:2], title="Jambe Évaluée", loc='upper left', bbox_to_anchor=(1.05, 1))
 fig1.tight_layout(rect=[0, 0, 0.95, 1])
 
-# --- LIGNES AJOUTÉES POUR SAUVEGARDER LE PREMIER GRAPH ---
 plot_box_path = os.path.join(plots_correlations_folder, "Comparaison_Gauche_Droite_Angle_Frontal.png")
 fig1.savefig(plot_box_path, dpi=300, bbox_inches='tight')
-print(f"🖼️ Graphique de comparaison Gauche/Droite enregistré sous : {plot_box_path}")
+
+
+# ==============================================================================
+# 5.5 GRAPHIQUE 2 : COMPARAISON HÉMIPLÉGIQUE vs DIPLÉGIQUE (LMM)
+# ==============================================================================
+print("\n" + "=" * 75)
+print(" 📊 COMPARAISON : HÉMIPLÉGIQUE vs DIPLÉGIQUE (LMM Patient -> Visite)")
+print("=" * 75)
+
+if df_long['Diagnostic_Global'].nunique() > 1:
+
+    # 1. Comparaison Jambe Droite : Hémi vs Di
+    df_droite = df_long[df_long['Jambe'] == 'Droite'].dropna(subset=['Angle_Frontal', 'ID_Patient', 'ID_Visite']).copy()
+    try:
+        md_d = smf.mixedlm("Angle_Frontal ~ C(Diagnostic_Global)", data=df_droite, groups=df_droite["ID_Patient"], vc_formula={"Visite": "0 + C(ID_Visite)"})
+        res_d = md_d.fit()
+        pval_d = res_d.pvalues.filter(like='Diagnostic_Global').iloc[0]
+        print(f"-> Jambe DROITE (Hémi vs Di) : p-value = {pval_d:.4f} {'***' if pval_d <= 0.001 else '**' if pval_d <= 0.01 else '*' if pval_d <= 0.05 else '(ns)'}")
+    except Exception as e:
+        print("Impossible de calculer LMM pour Jambe Droite.")
+
+    # 2. Comparaison Jambe Gauche : Hémi vs Di
+    df_gauche = df_long[df_long['Jambe'] == 'Gauche'].dropna(subset=['Angle_Frontal', 'ID_Patient', 'ID_Visite']).copy()
+    try:
+        md_g = smf.mixedlm("Angle_Frontal ~ C(Diagnostic_Global)", data=df_gauche, groups=df_gauche["ID_Patient"], vc_formula={"Visite": "0 + C(ID_Visite)"})
+        res_g = md_g.fit()
+        pval_g = res_g.pvalues.filter(like='Diagnostic_Global').iloc[0]
+        print(f"-> Jambe GAUCHE (Hémi vs Di) : p-value = {pval_g:.4f} {'***' if pval_g <= 0.001 else '**' if pval_g <= 0.01 else '*' if pval_g <= 0.05 else '(ns)'}")
+    except Exception as e:
+        print("Impossible de calculer LMM pour Jambe Gauche.")
+
+    # 3. Comparaison Générale : Hémi vs Di
+    df_clean = df_long.dropna(subset=['Angle_Frontal', 'ID_Patient', 'ID_Visite']).copy()
+    try:
+        md_gen = smf.mixedlm("Angle_Frontal ~ C(Diagnostic_Global)", data=df_clean, groups=df_clean["ID_Patient"], vc_formula={"Visite": "0 + C(ID_Visite)"})
+        res_gen = md_gen.fit()
+        pval_gen = res_gen.pvalues.filter(like='Diagnostic_Global').iloc[0]
+        print(f"-> GÉNÉRAL (Hémi vs Di)      : p-value = {pval_gen:.4f} {'***' if pval_gen <= 0.001 else '**' if pval_gen <= 0.01 else '*' if pval_gen <= 0.05 else '(ns)'}")
+    except Exception as e:
+        print("Impossible de calculer LMM Général.")
+
+    # --- GRAPHIQUE ---
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    fig2.canvas.manager.set_window_title('Comparaison : Hémiplégique vs Diplégique')
+
+    ordre_jambes = ['Gauche', 'Droite']
+    ordre_diag = ['Hémiplégique', 'Diplégique']
+
+    sns.boxplot(data=df_long, x='Jambe', y='Angle_Frontal', hue='Diagnostic_Global', hue_order=ordre_diag, order=ordre_jambes, palette={'Hémiplégique': '#2ca02c', 'Diplégique': '#d62728'}, width=0.6, boxprops={'alpha': 0.5}, ax=ax2)
+    sns.stripplot(data=df_long, x='Jambe', y='Angle_Frontal', hue='Diagnostic_Global', hue_order=ordre_diag, order=ordre_jambes, palette={'Hémiplégique': '#2ca02c', 'Diplégique': '#d62728'}, dodge=True, linewidth=1, edgecolor='gray', alpha=0.8, ax=ax2)
+
+    ymin, ymax = ax2.get_ylim()
+    y_range = ymax - ymin
+    y_bar = df_long['Angle_Frontal'].max() + (y_range * 0.05)
+    h = y_range * 0.02
+
+    def draw_significance(ax, x1, x2, y, h, pval):
+        sig = '***' if pval <= 0.001 else '**' if pval <= 0.01 else '*' if pval <= 0.05 else 'ns'
+        color = 'black' if pval <= 0.05 else 'gray'
+        lw = 1.5 if pval <= 0.05 else 1.0
+        alpha = 1.0 if pval <= 0.05 else 0.5
+        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=lw, c=color, alpha=alpha)
+        ax.text((x1 + x2) * .5, y + h, sig, ha='center', va='bottom', color=color, fontweight='bold', fontsize=12, alpha=alpha)
+
+    try:
+        if 'pval_g' in locals(): draw_significance(ax2, -0.2, 0.2, y_bar, h, pval_g)
+        if 'pval_d' in locals(): draw_significance(ax2, 0.8, 1.2, y_bar, h, pval_d)
+    except NameError: pass
+
+    ax2.set_ylim(ymin, y_bar + (y_range * 0.15))
+    ymin, ymax = ax2.get_ylim()
+
+    ax2.axhline(0, color='red', linestyle='--', linewidth=1.5, alpha=0.7, zorder=0)
+
+    if ymax > 0: ax2.text(1.02, ymax / 2, 'VALGUS (+)', transform=ax2.get_yaxis_transform(), color='black', fontsize=12, fontweight='bold', ha='left', va='center', rotation=90, alpha=0.6)
+    if ymin < 0: ax2.text(1.02, ymin / 2, 'VARUS (-)', transform=ax2.get_yaxis_transform(), color='black', fontsize=12, fontweight='bold', ha='left', va='center', rotation=90, alpha=0.6)
+
+    ax2.set_ylabel("Varus (-)   <---   Angle Frontal (Degrés)   --->   Valgus (+)", fontsize=13, fontweight='bold')
+    ax2.set_title("Comparaison des angles frontaux : Hémiplégiques vs Diplégiques", fontsize=15, fontweight='bold')
+    ax2.set_xlabel("Jambe Évaluée", fontsize=13)
+
+    handles, labels = ax2.get_legend_handles_labels()
+    if len(handles) >= 2: ax2.legend(handles[0:2], labels[0:2], title="Diagnostic", loc='upper left', bbox_to_anchor=(1.05, 1))
+
+    fig2.tight_layout(rect=[0, 0, 0.92, 1])
+    plot_hemi_di_path = os.path.join(plots_correlations_folder, "Comparaison_Hemi_vs_Di_Angle_Frontal.png")
+    fig2.savefig(plot_hemi_di_path, dpi=300, bbox_inches='tight')
+
+else:
+    print("⚠️ Impossible de comparer Hémi vs Di : un seul groupe diagnostic est présent.")
 
 # ==============================================================================
 # 6. AFFICHAGE DES FENÊTRES
 # ==============================================================================
-print("✅ Affichage du graphique (fermez la fenêtre pour terminer le script)...")
+print("✅ Affichage des graphiques (fermez les fenêtres pour terminer le script)...")
 plt.show()
