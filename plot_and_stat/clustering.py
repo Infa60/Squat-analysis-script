@@ -28,10 +28,10 @@ pd.set_option('display.colheader_justify', 'center')
 # ==============================================================================
 # --- 1. CONFIGURATION ---
 # ==============================================================================
-AVERAGE_TRIALS_PER_VISIT = True  # Mode d'agrégation clinique (Script 2)
+AVERAGE_TRIALS_PER_VISIT = False  # Mode d'agrégation clinique (Script 2)
 type_of_analysis = "average" if AVERAGE_TRIALS_PER_VISIT else "all_visit"
 
-CLUSTERING_MODE = 'BOTH'  # 'MAX', 'CURVE', ou 'BOTH'
+CLUSTERING_MODE = 'MAX'  # 'MAX', 'CURVE', ou 'BOTH'
 ALGO_CLUSTERING = 'KMEANS'  # Options : 'HAC', 'GMM', 'KMEANS'
 NUM_CLUSTERS = 3
 DEFAULT_FPS = 50
@@ -40,7 +40,7 @@ POINTS_NORMALISATION = 101
 
 # --- DÉFINITION DES VARIABLES DE CLUSTERING (Script 1 - Mapping dynamique) ---
 # Vous pouvez ajouter 'Knee_Frontal' dans FEATURES_BASE si vous voulez l'inclure dans le clustering
-FEATURES_BASE = ['Knee', 'Trunk', 'Tibia']
+FEATURES_BASE = ['Knee', 'Trunk']
 
 FEATURE_MAPPING = {
     'Knee': ('Knee_Flexion_Max', 'Knee_Curve'),
@@ -568,3 +568,58 @@ if CLUSTERING_MODE == 'BOTH' and 'Profile_Max_Label' in df_max_pat.columns and '
     plt.close()
 
 print("\n✅ Pipeline de Clustering complet terminé avec succès ! Le fichier Excel est enrichi.")
+
+
+# ==============================================================================
+# --- 8. SAUVEGARDE DES LABELS DE CLUSTERING POUR LE FUZZY TREE ---
+# ==============================================================================
+print("\n--- SAUVEGARDE DES RÉSULTATS POUR LE FUZZY TREE ---")
+
+# 1. Définition des clés de jointure selon la méthode de calcul
+# Si on a moyenné par visite, on fusionne sur le Patient et la Visite.
+# Si on a gardé tous les essais, on fusionne de manière unique jusqu'au nom du fichier (essai).
+if AVERAGE_TRIALS_PER_VISIT:
+    merge_keys = ['ID_Patient', 'ID_Visite']
+else:
+    merge_keys = ['ID_Patient', 'ID_Visite', 'File_Sagittal']
+
+# 2. Récupération des labels de clustering MAX (si calculés)
+df_labels_max = pd.DataFrame()
+if CLUSTERING_MODE in ['MAX', 'BOTH'] and 'Profile_Max_Label' in df_max_pat.columns:
+    df_labels_max = df_max_pat[merge_keys + ['Profile_Max_Label']].copy()
+    # Suppression des doublons potentiels pour la fusion sécurisée
+    df_labels_max = df_labels_max.drop_duplicates(subset=merge_keys)
+
+# 3. Récupération des labels de clustering CURVE (si calculés)
+df_labels_curve = pd.DataFrame()
+if CLUSTERING_MODE in ['CURVE', 'BOTH'] and 'Profile_Curve_Label' in df_curve_pca_ready.columns:
+    df_labels_curve = df_curve_pca_ready[merge_keys + ['Profile_Curve_Label']].copy()
+    # Suppression des doublons potentiels pour la fusion sécurisée
+    df_labels_curve = df_labels_curve.drop_duplicates(subset=merge_keys)
+
+# 4. Fusion avec la base de données traitée (df_pat_processed)
+# On utilise df_pat_processed plutôt que df_master_pat car les variables
+# cliniques y sont déjà converties en numérique (prêt pour l'IA).
+df_export = df_pat_processed.copy()
+
+if not df_labels_max.empty:
+    df_export = pd.merge(df_export, df_labels_max, on=merge_keys, how='left')
+
+if not df_labels_curve.empty:
+    df_export = pd.merge(df_export, df_labels_curve, on=merge_keys, how='left')
+
+# 5. Sauvegarde du nouveau fichier pickle
+export_file_name = f"Master_Database_Patient_Clustered_{ALGO_CLUSTERING}_{NUM_CLUSTERS}_{type_of_analysis}.pkl"
+export_path = os.path.join(main_path, "Data", export_file_name)
+
+df_export.to_pickle(export_path)
+
+# Petit résumé dans la console pour vérifier que tout s'est bien passé
+lignes_exportees = len(df_export)
+patients_exportes = df_export['ID_Patient'].nunique()
+print(f"✅ Sauvegarde réussie : {export_file_name}")
+print(f"   -> {lignes_exportees} lignes (essais) sauvegardées pour {patients_exportes} patients uniques.")
+if 'Profile_Max_Label' in df_export.columns:
+    print(f"   -> Répartition Max   : {df_export['Profile_Max_Label'].value_counts().to_dict()}")
+if 'Profile_Curve_Label' in df_export.columns:
+    print(f"   -> Répartition Curve : {df_export['Profile_Curve_Label'].value_counts().to_dict()}")
