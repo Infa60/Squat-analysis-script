@@ -1,8 +1,18 @@
-# Ignore model files
+# Modèles d'Intelligence Artificielle
 *.pt
 *.pth
+*.h5
+*.onnx
 
-# Ignore Python virtual environments
+# Environnements virtuels Python
 venv/
 env/
+fmpose_3d/
+miniconda3/
+
+# Fichiers temporaires Python
 __pycache__/
+*.pyc
+
+# Fichiers de configuration locaux (mots de passe, clés d'API)
+.env
