@@ -4,7 +4,7 @@ import matplotlib.animation as animation
 from scipy.signal import savgol_filter
 
 # --- CONFIGURATION ---
-POSE_FILE = "output_poses_3d.npy"
+POSE_FILE = r"output_poses_3d.npy"
 
 # --- COULEURS ---
 BONES_COLORED = [
@@ -97,7 +97,7 @@ def main():
         if anim_running:
             ax.set_title(f"▶️ Visualisation 3D LISSÉE - Frame {frame_idx} (Espace pour pause)")
 
-        ax.view_init(elev=10, azim=-90)
+        ax.view_init(elev=0, azim=0)
 
         if np.all(pose == 0):
             return

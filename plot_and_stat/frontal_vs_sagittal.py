@@ -229,7 +229,7 @@ for var in clinical_cols:
 
             safe_var_name = str(var).replace('/', '_').replace('\\', '_').replace(' ', '_')
             plot_path = os.path.join(plots_correlations_folder, f"Corr_{safe_var_name}.png")
-            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            # .savefig(plot_path, dpi=300, bbox_inches='tight')
             plt.close()
 
 df_corr = pd.DataFrame(results_corr)
