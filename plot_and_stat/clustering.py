@@ -19,6 +19,7 @@ from fonction import *
 
 warnings.filterwarnings('ignore')
 
+
 # --- PANDAS CONFIGURATION ---
 pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
