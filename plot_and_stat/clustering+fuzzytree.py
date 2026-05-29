@@ -25,16 +25,14 @@ pd.set_option('display.colheader_justify', 'center')
 # ==============================================================================
 # --- 1. CONFIGURATION ---
 # ==============================================================================
-AVERAGE_TRIALS_PER_VISIT = False  # Mode d'agrégation clinique
+AVERAGE_TRIALS_PER_VISIT = False
 type_of_analysis = "average" if AVERAGE_TRIALS_PER_VISIT else "all_visit"
 
-# 🔴 LISTE DES ALGORITHMES À TESTER
 ALGOS_A_TESTER = ['GMM', 'KMEANS', 'HAC']
 
 DEFAULT_FPS = 50
 CUTOFF_FREQ = 3
 
-# --- DÉFINITION DES VARIABLES DE CLUSTERING ---
 FEATURES_BASE = ['Knee', 'Tibia', 'Trunk', 'Knee_Frontal']
 
 FEATURE_MAPPING_MAX = {
@@ -108,7 +106,7 @@ def get_clustering_model(algo_name, k):
         raise ValueError(f"Algorithme {algo_name} non reconnu.")
 
 
-def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'):
+def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID', current_depth=5):
     X = df_tree[variables_cliniques].copy()
     y = df_tree[target_col]
 
@@ -124,15 +122,8 @@ def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'
     comptage = y.value_counts()
     min_class_count = comptage.min()
 
-    for cluster_id, count in comptage.items():
-        if count < 2:
-            infos_isoles = df_tree[df_tree[target_col] == cluster_id][['ID_Patient', 'ID_Visite']].to_dict(
-                orient='records')
-            print(f"      🚨 CRITIQUE : Cluster {cluster_id} a 1 seul membre ! -> {infos_isoles}")
-        elif count < 5:
-            pass  # print(f"      ⚠️ WARNING : Cluster {cluster_id} a moins de 5 membres (n={count}).")
-
-    tree_model = DecisionTreeClassifier(max_depth=5, min_samples_leaf=3, criterion='entropy', random_state=42)
+    tree_model = DecisionTreeClassifier(max_depth=current_depth, min_samples_leaf=3, criterion='entropy',
+                                        random_state=42)
     n_splits = 5
 
     if min_class_count >= n_splits:
@@ -206,7 +197,6 @@ for idx, row in df_base_pat.iterrows():
         k_max = process_kinematics_max(k_f, fps)
         tr_max = process_kinematics_max(tr_f, fps)
         tib_max = process_kinematics_max(tib_f, fps)
-
         kf_max = np.nan
 
         if 'Keypoints_frontal' in row and isinstance(row['Keypoints_frontal'], np.ndarray):
@@ -258,6 +248,7 @@ else:
 # ==============================================================================
 toutes_variables_cinematiques = [FEATURE_MAPPING_MAX[f] for f in FEATURES_BASE]
 k_range = range(2, 6)
+depth_range = [3, 4, 5, 6]
 
 combinaisons_cinematiques = []
 for r in range(1, len(toutes_variables_cinematiques) + 1):
@@ -269,16 +260,14 @@ all_clinical_cols = [c for c in df_pat_final.columns if
 cols_scores = [c for c in all_clinical_cols if 'Score' in c]
 cols_autres = [c for c in all_clinical_cols if 'Score' not in c]
 
-total_tests = len(combinaisons_cinematiques) * len(k_range)
+total_tests = len(combinaisons_cinematiques) * len(k_range) * len(depth_range)
 
-# BOUCLE PRINCIPALE SUR LES ALGORITHMES
 for current_algo in ALGOS_A_TESTER:
     print(f"\n{'=' * 60}")
     print(f"🚀 LANCEMENT DU PIPELINE POUR L'ALGORITHME : {current_algo}")
     print(f"{'=' * 60}")
 
-    # Création du dossier spécifique à l'algorithme
-    output_plot_folder = fr"{main_path}\Results_v3\Plot_{current_algo}_right_{type_of_analysis}"
+    output_plot_folder = fr"{main_path}\Results_v5\Plot_{current_algo}_right_{type_of_analysis}"
     os.makedirs(output_plot_folder, exist_ok=True)
 
     resultats_pipeline = []
@@ -291,79 +280,125 @@ for current_algo in ALGOS_A_TESTER:
         df_temp = df_pat_final.dropna(subset=kin_vars_list).copy()
 
         if df_temp.empty: continue
-
         X_kin_scaled = StandardScaler().fit_transform(df_temp[kin_vars_list])
 
         for k in k_range:
-            # Récupération et entraînement du bon algorithme
             model = get_clustering_model(current_algo, k)
             df_temp['Cluster_ID'] = model.fit_predict(X_kin_scaled)
 
-            # Calcul de la répartition
+            # --- FILTRE 1 : MINIMUM 10 PATIENTS PAR CLUSTER ---
             df_temp['Patient_Visit'] = df_temp['ID_Patient'].astype(str) + "_" + df_temp['ID_Visite'].astype(str)
             repartition_list = []
+            cluster_valide = True
+
             for c_id in range(k):
                 sub = df_temp[df_temp['Cluster_ID'] == c_id]
                 n_pat = sub['ID_Patient'].nunique()
+
+                if n_pat < 10:
+                    cluster_valide = False
+
                 n_vis = sub['Patient_Visit'].nunique()
                 n_ess = len(sub)
                 repartition_list.append(f"C{c_id}: {n_pat}P/{n_vis}V/{n_ess}E")
+
             repartition_str = " | ".join(repartition_list)
+
+            if not cluster_valide:
+                print(
+                    f"[{current_algo}] Rejeté (Cinématique: {kin_vars_list} | k={k}) -> Un cluster a moins de 10 patients.")
+                test_actuel += len(depth_range)
+                continue
+            # ------------------------------------------------
 
             df_tree_base = df_temp.sort_values(by=['ID_Patient', 'ID_Visite']).drop_duplicates(subset=['ID_Patient'],
                                                                                                keep='first')
 
-            acc_scores, sens_scores, spec_scores, _ = evaluate_tree_silently(df_tree_base, cols_scores,
-                                                                             target_col='Cluster_ID')
-            acc_autres, sens_autres, spec_autres, _ = evaluate_tree_silently(df_tree_base, cols_autres,
-                                                                             target_col='Cluster_ID')
+            best_acc_for_current_setup = -1
 
-            max_acc = max(acc_scores, acc_autres)
+            for depth in depth_range:
+                acc_scores, sens_scores, spec_scores, _ = evaluate_tree_silently(df_tree_base, cols_scores,
+                                                                                 target_col='Cluster_ID',
+                                                                                 current_depth=depth)
+                acc_autres, sens_autres, spec_autres, _ = evaluate_tree_silently(df_tree_base, cols_autres,
+                                                                                 target_col='Cluster_ID',
+                                                                                 current_depth=depth)
 
-            if acc_scores > acc_autres:
-                type_gagnant = "Scores"
-                best_sens, best_spec = sens_scores, spec_scores
-            else:
-                type_gagnant = "Clinique (Autre)"
-                best_sens, best_spec = sens_autres, spec_autres
+                max_acc = max(acc_scores, acc_autres)
 
-            resultats_pipeline.append({
-                'Algorithme': current_algo,
-                'Variables_Cinematiques': kin_vars_list,
-                'Nb_Clusters': k,
-                'Max_Accuracy': max_acc,
-                'Sensibilite': best_sens,
-                'Specificite': best_spec,
-                'Meilleur_Predictif': type_gagnant,
-                'Détails_Clusters (Pat/Vis/Essais)': repartition_str
-            })
+                # --- FILTRE 2 : HASARD DE BASE ---
+                seuil_hasard = (1.0 / k) + 0.05  # Le hasard pur + une marge de tolérance de 5%
+                if max_acc <= seuil_hasard:
+                    print(
+                        f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}% (Ignoré : Résultat inférieur ou égal au hasard)")
+                    test_actuel += 1
+                    continue
+                # ---------------------------------
 
-            if max_acc > meilleur_score_global:
-                meilleur_score_global = max_acc
-                meilleure_configuration = {
+                # --- FILTRE 3 : PROFONDEUR UTILE ---
+                if max_acc <= best_acc_for_current_setup + 0.001:
+                    print(
+                        f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}% (Ignoré : N'améliore pas l'arbre plus petit)")
+                    test_actuel += 1
+                    continue
+
+                best_acc_for_current_setup = max_acc
+                # -----------------------------------
+
+                if acc_scores > acc_autres:
+                    type_gagnant = "Scores"
+                    best_sens, best_spec = sens_scores, spec_scores
+                else:
+                    type_gagnant = "Clinique (Autre)"
+                    best_sens, best_spec = sens_autres, spec_autres
+
+                resultats_pipeline.append({
+                    'Algorithme': current_algo,
                     'Variables_Cinematiques': kin_vars_list,
                     'Nb_Clusters': k,
-                    'Type_Clinique': 'cols_scores' if acc_scores > acc_autres else 'cols_autres',
-                    'Variables_X': cols_scores if acc_scores > acc_autres else cols_autres,
-                    'Dataframe': df_tree_base.copy()
-                }
+                    'Profondeur_Arbre': depth,
+                    'Max_Accuracy': max_acc,
+                    'Sensibilite': best_sens,
+                    'Specificite': best_spec,
+                    'Baseline_Hasard': round(1.0 / k, 2),  # Ajout dans le Excel pour traçabilité
+                    'Meilleur_Predictif': type_gagnant,
+                    'Détails_Clusters (Pat/Vis/Essais)': repartition_str
+                })
 
-            print(
-                f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} -> Max Acc: {max_acc * 100:.1f}%")
-            test_actuel += 1
+                if max_acc > meilleur_score_global:
+                    meilleur_score_global = max_acc
+                    meilleure_configuration = {
+                        'Variables_Cinematiques': kin_vars_list,
+                        'Nb_Clusters': k,
+                        'Profondeur_Arbre': depth,
+                        'Type_Clinique': 'cols_scores' if acc_scores > acc_autres else 'cols_autres',
+                        'Variables_X': cols_scores if acc_scores > acc_autres else cols_autres,
+                        'Dataframe': df_tree_base.copy()
+                    }
+
+                print(
+                    f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}%")
+                test_actuel += 1
 
     # --- AFFICHAGE ET SAUVEGARDE POUR L'ALGORITHME EN COURS ---
+    if not resultats_pipeline:
+        print(f"⚠️ Aucun résultat valide trouvé pour {current_algo} (clusters < 10 patients ou arbres = hasard).")
+        continue
+
     df_resultats = pd.DataFrame(resultats_pipeline).sort_values(by='Max_Accuracy', ascending=False)
     print("\n" + "-" * 50)
     print(f"🏆 TOP 3 - {current_algo}")
     print("-" * 50)
-    print(
-        df_resultats[['Variables_Cinematiques', 'Nb_Clusters', 'Max_Accuracy', 'Meilleur_Predictif']].head(3).to_string(
-            index=False))
+    print(df_resultats[
+              ['Variables_Cinematiques', 'Nb_Clusters', 'Profondeur_Arbre', 'Max_Accuracy', 'Meilleur_Predictif']].head(
+        3).to_string(index=False))
 
     df_best = meilleure_configuration['Dataframe']
     best_vars_cliniques = meilleure_configuration['Variables_X']
-    _, _, _, best_tree_model = evaluate_tree_silently(df_best, best_vars_cliniques, target_col='Cluster_ID')
+    best_depth = meilleure_configuration['Profondeur_Arbre']
+
+    _, _, _, best_tree_model = evaluate_tree_silently(df_best, best_vars_cliniques, target_col='Cluster_ID',
+                                                      current_depth=best_depth)
 
     X_best = df_best[best_vars_cliniques].copy()
     cols_valides = [c for c in best_vars_cliniques if X_best[c].isna().mean() <= 0.3]
@@ -379,11 +414,11 @@ for current_algo in ALGOS_A_TESTER:
               fontsize=9)
 
     plt.title(
-        f"Meilleur Arbre ({current_algo}) - Acc: {meilleur_score_global * 100:.1f}% | Clusters: {meilleure_configuration['Nb_Clusters']}\nVariables: {meilleure_configuration['Variables_Cinematiques']}",
+        f"Meilleur Arbre ({current_algo}) - Acc: {meilleur_score_global * 100:.1f}% | Clusters: {meilleure_configuration['Nb_Clusters']} | Profondeur: {best_depth}\nVariables: {meilleure_configuration['Variables_Cinematiques']}",
         fontsize=16, fontweight='bold')
     plt.tight_layout()
     plt.savefig(os.path.join(output_plot_folder, f"Best_Decision_Tree_{current_algo}.png"), dpi=300)
-    plt.close()  # Très important pour éviter que les graphiques se superposent entre les boucles !
+    plt.close()
 
     df_resultats.to_excel(os.path.join(output_plot_folder, f"Resultats_Pipeline_{current_algo}.xlsx"), index=False)
     print(f"✅ Résultats sauvegardés dans :\n{output_plot_folder}\n")
