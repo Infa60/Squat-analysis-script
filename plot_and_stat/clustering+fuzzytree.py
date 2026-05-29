@@ -28,7 +28,9 @@ pd.set_option('display.colheader_justify', 'center')
 AVERAGE_TRIALS_PER_VISIT = False  # Mode d'agrégation clinique
 type_of_analysis = "average" if AVERAGE_TRIALS_PER_VISIT else "all_visit"
 
-ALGO_CLUSTERING = 'GMM'
+# 🔴 LISTE DES ALGORITHMES À TESTER
+ALGOS_A_TESTER = ['GMM', 'KMEANS', 'HAC']
+
 DEFAULT_FPS = 50
 CUTOFF_FREQ = 3
 
@@ -49,10 +51,7 @@ main_path = r"C:\Users\bourgema\OneDrive - Université de Genève\PHD\Part1"
 master_db_patient_file = fr"{main_path}\Data\Master_Database_Patient_all.pkl"
 frontal_db_patient_file = fr"{main_path}\Data\Master_Database_Patient_Frontal_all.pkl"
 master_db_healthy_file = fr"{main_path}\Data\Master_Database_Healthy_all.pkl"
-
 features_str = "_".join(FEATURES_BASE)
-output_plot_folder = fr"{main_path}\Results_v3\Plot_{ALGO_CLUSTERING}_right_{type_of_analysis}"
-os.makedirs(output_plot_folder, exist_ok=True)
 
 
 # ==============================================================================
@@ -96,6 +95,78 @@ def calculate_valgus_varus_frontal(hip, knee, ankle, side):
     angle_deg = np.degrees(np.arctan2(cross_product, dot_product))
     if side == 'gauche': angle_deg = -angle_deg
     return angle_deg
+
+
+def get_clustering_model(algo_name, k):
+    if algo_name == 'GMM':
+        return GaussianMixture(n_components=k, covariance_type='full', random_state=42, n_init=5)
+    elif algo_name == 'KMEANS':
+        return KMeans(n_clusters=k, random_state=42, n_init=10)
+    elif algo_name == 'HAC':
+        return AgglomerativeClustering(n_clusters=k)
+    else:
+        raise ValueError(f"Algorithme {algo_name} non reconnu.")
+
+
+def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'):
+    X = df_tree[variables_cliniques].copy()
+    y = df_tree[target_col]
+
+    colonnes_a_garder = []
+    for col in variables_cliniques:
+        if X[col].isna().mean() <= 0.3:
+            X[col] = X[col].fillna(X[col].median())
+            colonnes_a_garder.append(col)
+
+    X = X[colonnes_a_garder]
+    if X.empty: return 0.0, 0.0, 0.0, None
+
+    comptage = y.value_counts()
+    min_class_count = comptage.min()
+
+    for cluster_id, count in comptage.items():
+        if count < 2:
+            infos_isoles = df_tree[df_tree[target_col] == cluster_id][['ID_Patient', 'ID_Visite']].to_dict(
+                orient='records')
+            print(f"      🚨 CRITIQUE : Cluster {cluster_id} a 1 seul membre ! -> {infos_isoles}")
+        elif count < 5:
+            pass  # print(f"      ⚠️ WARNING : Cluster {cluster_id} a moins de 5 membres (n={count}).")
+
+    tree_model = DecisionTreeClassifier(max_depth=5, min_samples_leaf=3, criterion='entropy', random_state=42)
+    n_splits = 5
+
+    if min_class_count >= n_splits:
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    else:
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    acc_scores, sens_scores, spec_scores = [], [], []
+
+    for train_idx, test_idx in cv.split(X, y):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        tree_model.fit(X_train, y_train)
+        y_pred = tree_model.predict(X_test)
+
+        acc = accuracy_score(y_test, y_pred)
+        cm = confusion_matrix(y_test, y_pred, labels=np.unique(y))
+
+        TP = np.diag(cm)
+        FP = np.sum(cm, axis=0) - TP
+        FN = np.sum(cm, axis=1) - TP
+        TN = np.sum(cm) - (FP + FN + TP)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sens_par_classe = np.nan_to_num(TP / (TP + FN), nan=0.0)
+            spec_par_classe = np.nan_to_num(TN / (TN + FP), nan=0.0)
+
+        acc_scores.append(acc)
+        sens_scores.append(np.mean(sens_par_classe))
+        spec_scores.append(np.mean(spec_par_classe))
+
+    tree_model.fit(X, y)
+    return np.mean(acc_scores), np.mean(sens_scores), np.mean(spec_scores), tree_model
 
 
 # ==============================================================================
@@ -175,7 +246,7 @@ df_pat_processed = pd.DataFrame(processed_pat)
 if AVERAGE_TRIALS_PER_VISIT:
     clin_cols = [c for c in df_pat_processed.columns if
                  c.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_'))]
-    agg_dict = {f: 'median' for f in FEATURES_MAX}
+    agg_dict = {f: 'mean' for f in FEATURES_MAX}
     agg_dict.update({c: 'mean' for c in clin_cols})
     agg_dict.update({'Scores_GMFCS': 'first', 'Diag_Lateralite': 'first'})
     df_pat_final = df_pat_processed.groupby(['ID_Patient', 'ID_Visite', 'Diagnostic']).agg(agg_dict).reset_index()
@@ -183,11 +254,8 @@ else:
     df_pat_final = df_pat_processed.copy()
 
 # ==============================================================================
-# --- 5. PIPELINE AUTOMATISÉ : CLUSTERING + FUZZY TREE ---
+# --- 5 & 6. PIPELINE AUTOMATISÉ POUR CHAQUE ALGORITHME ---
 # ==============================================================================
-print("\n--- DÉMARRAGE DU PIPELINE D'OPTIMISATION AUTOMATIQUE ---")
-
-# 1. Définition de l'espace de recherche
 toutes_variables_cinematiques = [FEATURE_MAPPING_MAX[f] for f in FEATURES_BASE]
 k_range = range(2, 6)
 
@@ -195,183 +263,129 @@ combinaisons_cinematiques = []
 for r in range(1, len(toutes_variables_cinematiques) + 1):
     combinaisons_cinematiques.extend(list(combinations(toutes_variables_cinematiques, r)))
 
-# 2. Préparation des variables cliniques (Cibles de l'arbre)
 all_clinical_cols = [c for c in df_pat_final.columns if
                      c.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_')) and not c.endswith(
                          'G')]
 cols_scores = [c for c in all_clinical_cols if 'Score' in c]
 cols_autres = [c for c in all_clinical_cols if 'Score' not in c]
 
-resultats_pipeline = []
-meilleur_score_global = 0
-meilleure_configuration = {}
-
-
-def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_GMM'):
-    X = df_tree[variables_cliniques].copy()
-    y = df_tree[target_col]
-
-    colonnes_a_garder = []
-    for col in variables_cliniques:
-        if X[col].isna().mean() <= 0.3:
-            X[col] = X[col].fillna(X[col].median())
-            colonnes_a_garder.append(col)
-
-    X = X[colonnes_a_garder]
-    if X.empty: return 0.0, 0.0, 0.0, None
-
-    comptage = y.value_counts()
-    min_class_count = comptage.min()
-
-    for cluster_id, count in comptage.items():
-        if count < 2:
-            infos_isoles = df_tree[df_tree[target_col] == cluster_id][['ID_Patient', 'ID_Visite']].to_dict(
-                orient='records')
-            print(f"      🚨 CRITIQUE : Cluster {cluster_id} a 1 seul membre ! -> {infos_isoles}")
-        elif count < 5:
-            print(f"      ⚠️ WARNING : Cluster {cluster_id} a moins de 5 membres (n={count}).")
-
-    tree_model = DecisionTreeClassifier(max_depth=5, min_samples_leaf=3, criterion='entropy', random_state=42)
-    n_splits = 5
-
-    if min_class_count >= n_splits:
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    else:
-        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-    acc_scores, sens_scores, spec_scores = [], [], []
-
-    for train_idx, test_idx in cv.split(X, y):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-
-        tree_model.fit(X_train, y_train)
-        y_pred = tree_model.predict(X_test)
-
-        acc = accuracy_score(y_test, y_pred)
-        cm = confusion_matrix(y_test, y_pred, labels=np.unique(y))
-
-        TP = np.diag(cm)
-        FP = np.sum(cm, axis=0) - TP
-        FN = np.sum(cm, axis=1) - TP
-        TN = np.sum(cm) - (FP + FN + TP)
-
-        with np.errstate(divide='ignore', invalid='ignore'):
-            sens_par_classe = np.nan_to_num(TP / (TP + FN), nan=0.0)
-            spec_par_classe = np.nan_to_num(TN / (TN + FP), nan=0.0)
-
-        acc_scores.append(acc)
-        sens_scores.append(np.mean(sens_par_classe))
-        spec_scores.append(np.mean(spec_par_classe))
-
-    tree_model.fit(X, y)
-    return np.mean(acc_scores), np.mean(sens_scores), np.mean(spec_scores), tree_model
-
-
-# 3. La grande boucle de recherche
 total_tests = len(combinaisons_cinematiques) * len(k_range)
-test_actuel = 1
 
-print(f"Lancement de {total_tests} tests de configurations...")
+# BOUCLE PRINCIPALE SUR LES ALGORITHMES
+for current_algo in ALGOS_A_TESTER:
+    print(f"\n{'=' * 60}")
+    print(f"🚀 LANCEMENT DU PIPELINE POUR L'ALGORITHME : {current_algo}")
+    print(f"{'=' * 60}")
 
-for kin_vars in combinaisons_cinematiques:
-    kin_vars_list = list(kin_vars)
-    df_temp = df_pat_final.dropna(subset=kin_vars_list).copy()
+    # Création du dossier spécifique à l'algorithme
+    output_plot_folder = fr"{main_path}\Results_v3\Plot_{current_algo}_right_{type_of_analysis}"
+    os.makedirs(output_plot_folder, exist_ok=True)
 
-    if df_temp.empty: continue
+    resultats_pipeline = []
+    meilleur_score_global = 0
+    meilleure_configuration = {}
+    test_actuel = 1
 
-    X_kin_scaled = StandardScaler().fit_transform(df_temp[kin_vars_list])
+    for kin_vars in combinaisons_cinematiques:
+        kin_vars_list = list(kin_vars)
+        df_temp = df_pat_final.dropna(subset=kin_vars_list).copy()
 
-    for k in k_range:
-        gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42, n_init=5)
-        df_temp['Cluster_GMM'] = gmm.fit_predict(X_kin_scaled)
+        if df_temp.empty: continue
 
-        # --- CALCUL DE LA RÉPARTITION POUR L'EXCEL ---
-        df_temp['Patient_Visit'] = df_temp['ID_Patient'].astype(str) + "_" + df_temp['ID_Visite'].astype(str)
-        repartition_list = []
-        for c_id in range(k):
-            sub = df_temp[df_temp['Cluster_GMM'] == c_id]
-            n_pat = sub['ID_Patient'].nunique()
-            n_vis = sub['Patient_Visit'].nunique()
-            n_ess = len(sub)
-            repartition_list.append(f"C{c_id}: {n_pat}P/{n_vis}V/{n_ess}E")
-        repartition_str = " | ".join(repartition_list)
+        X_kin_scaled = StandardScaler().fit_transform(df_temp[kin_vars_list])
 
-        df_tree_base = df_temp.sort_values(by=['ID_Patient', 'ID_Visite']).drop_duplicates(subset=['ID_Patient'],
-                                                                                           keep='first')
+        for k in k_range:
+            # Récupération et entraînement du bon algorithme
+            model = get_clustering_model(current_algo, k)
+            df_temp['Cluster_ID'] = model.fit_predict(X_kin_scaled)
 
-        acc_scores, sens_scores, spec_scores, _ = evaluate_tree_silently(df_tree_base, cols_scores)
-        acc_autres, sens_autres, spec_autres, _ = evaluate_tree_silently(df_tree_base, cols_autres)
+            # Calcul de la répartition
+            df_temp['Patient_Visit'] = df_temp['ID_Patient'].astype(str) + "_" + df_temp['ID_Visite'].astype(str)
+            repartition_list = []
+            for c_id in range(k):
+                sub = df_temp[df_temp['Cluster_ID'] == c_id]
+                n_pat = sub['ID_Patient'].nunique()
+                n_vis = sub['Patient_Visit'].nunique()
+                n_ess = len(sub)
+                repartition_list.append(f"C{c_id}: {n_pat}P/{n_vis}V/{n_ess}E")
+            repartition_str = " | ".join(repartition_list)
 
-        max_acc = max(acc_scores, acc_autres)
+            df_tree_base = df_temp.sort_values(by=['ID_Patient', 'ID_Visite']).drop_duplicates(subset=['ID_Patient'],
+                                                                                               keep='first')
 
-        if acc_scores > acc_autres:
-            type_gagnant = "Scores"
-            best_sens = sens_scores
-            best_spec = spec_scores
-        else:
-            type_gagnant = "Clinique (Autre)"
-            best_sens = sens_autres
-            best_spec = spec_autres
+            acc_scores, sens_scores, spec_scores, _ = evaluate_tree_silently(df_tree_base, cols_scores,
+                                                                             target_col='Cluster_ID')
+            acc_autres, sens_autres, spec_autres, _ = evaluate_tree_silently(df_tree_base, cols_autres,
+                                                                             target_col='Cluster_ID')
 
-        resultats_pipeline.append({
-            'Variables_Cinematiques': kin_vars_list,
-            'Nb_Clusters': k,
-            'Max_Accuracy': max_acc,
-            'Sensibilite': best_sens,
-            'Specificite': best_spec,
-            'Meilleur_Predictif': type_gagnant,
-            'Détails_Clusters (Pat/Vis/Essais)': repartition_str  # <-- AJOUT ICI
-        })
+            max_acc = max(acc_scores, acc_autres)
 
-        if max_acc > meilleur_score_global:
-            meilleur_score_global = max_acc
-            meilleure_configuration = {
+            if acc_scores > acc_autres:
+                type_gagnant = "Scores"
+                best_sens, best_spec = sens_scores, spec_scores
+            else:
+                type_gagnant = "Clinique (Autre)"
+                best_sens, best_spec = sens_autres, spec_autres
+
+            resultats_pipeline.append({
+                'Algorithme': current_algo,
                 'Variables_Cinematiques': kin_vars_list,
                 'Nb_Clusters': k,
-                'Type_Clinique': 'cols_scores' if acc_scores > acc_autres else 'cols_autres',
-                'Variables_X': cols_scores if acc_scores > acc_autres else cols_autres,
-                'Dataframe': df_tree_base.copy()
-            }
+                'Max_Accuracy': max_acc,
+                'Sensibilite': best_sens,
+                'Specificite': best_spec,
+                'Meilleur_Predictif': type_gagnant,
+                'Détails_Clusters (Pat/Vis/Essais)': repartition_str
+            })
 
-        print(
-            f"Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} -> Max Acc: {max_acc * 100:.1f}%")
-        test_actuel += 1
+            if max_acc > meilleur_score_global:
+                meilleur_score_global = max_acc
+                meilleure_configuration = {
+                    'Variables_Cinematiques': kin_vars_list,
+                    'Nb_Clusters': k,
+                    'Type_Clinique': 'cols_scores' if acc_scores > acc_autres else 'cols_autres',
+                    'Variables_X': cols_scores if acc_scores > acc_autres else cols_autres,
+                    'Dataframe': df_tree_base.copy()
+                }
 
-# ==============================================================================
-# --- 6. AFFICHAGE DES RÉSULTATS GAGNANTS ET DU MEILLEUR ARBRE ---
-# ==============================================================================
-df_resultats = pd.DataFrame(resultats_pipeline).sort_values(by='Max_Accuracy', ascending=False)
-print("\n" + "=" * 50)
-print("🏆 RECHERCHE TERMINÉE - TOP 3 DES CONFIGURATIONS")
-print("=" * 50)
-print(df_resultats[['Variables_Cinematiques', 'Nb_Clusters', 'Max_Accuracy', 'Meilleur_Predictif']].head(3).to_string(
-    index=False))
+            print(
+                f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} -> Max Acc: {max_acc * 100:.1f}%")
+            test_actuel += 1
 
-print("\nGénération de l'arbre final pour la meilleure configuration...")
-df_best = meilleure_configuration['Dataframe']
-best_vars_cliniques = meilleure_configuration['Variables_X']
-_, _, _, best_tree_model = evaluate_tree_silently(df_best, best_vars_cliniques)
+    # --- AFFICHAGE ET SAUVEGARDE POUR L'ALGORITHME EN COURS ---
+    df_resultats = pd.DataFrame(resultats_pipeline).sort_values(by='Max_Accuracy', ascending=False)
+    print("\n" + "-" * 50)
+    print(f"🏆 TOP 3 - {current_algo}")
+    print("-" * 50)
+    print(
+        df_resultats[['Variables_Cinematiques', 'Nb_Clusters', 'Max_Accuracy', 'Meilleur_Predictif']].head(3).to_string(
+            index=False))
 
-X_best = df_best[best_vars_cliniques].copy()
-cols_valides = [c for c in best_vars_cliniques if X_best[c].isna().mean() <= 0.3]
+    df_best = meilleure_configuration['Dataframe']
+    best_vars_cliniques = meilleure_configuration['Variables_X']
+    _, _, _, best_tree_model = evaluate_tree_silently(df_best, best_vars_cliniques, target_col='Cluster_ID')
 
-plt.figure(figsize=(25, 12))
-class_names_str = [f"Cluster {c}" for c in best_tree_model.classes_]
+    X_best = df_best[best_vars_cliniques].copy()
+    cols_valides = [c for c in best_vars_cliniques if X_best[c].isna().mean() <= 0.3]
 
-plot_tree(best_tree_model,
-          feature_names=cols_valides,
-          class_names=class_names_str,
-          filled=True,
-          rounded=True,
-          fontsize=9)
+    plt.figure(figsize=(25, 12))
+    class_names_str = [f"Cluster {c}" for c in best_tree_model.classes_]
 
-plt.title(
-    f"Meilleur Arbre (Acc: {meilleur_score_global * 100:.1f}%) | Clusters: {meilleure_configuration['Nb_Clusters']} | Variables: {meilleure_configuration['Variables_Cinematiques']}",
-    fontsize=16, fontweight='bold')
-plt.tight_layout()
-plt.savefig(os.path.join(output_plot_folder, "Best_Decision_Tree.png"), dpi=300)
-plt.show()
+    plot_tree(best_tree_model,
+              feature_names=cols_valides,
+              class_names=class_names_str,
+              filled=True,
+              rounded=True,
+              fontsize=9)
 
-df_resultats.to_excel(os.path.join(output_plot_folder, "Resultats_Pipeline_Complet.xlsx"), index=False)
-print(f"\n✅ Pipeline terminé ! Les résultats ont été sauvegardés dans :\n{output_plot_folder}")
+    plt.title(
+        f"Meilleur Arbre ({current_algo}) - Acc: {meilleur_score_global * 100:.1f}% | Clusters: {meilleure_configuration['Nb_Clusters']}\nVariables: {meilleure_configuration['Variables_Cinematiques']}",
+        fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_plot_folder, f"Best_Decision_Tree_{current_algo}.png"), dpi=300)
+    plt.close()  # Très important pour éviter que les graphiques se superposent entre les boucles !
+
+    df_resultats.to_excel(os.path.join(output_plot_folder, f"Resultats_Pipeline_{current_algo}.xlsx"), index=False)
+    print(f"✅ Résultats sauvegardés dans :\n{output_plot_folder}\n")
+
+print("\n🎉 ANALYSE MULTI-ALGORITHMES TERMINÉE AVEC SUCCÈS ! 🎉")
