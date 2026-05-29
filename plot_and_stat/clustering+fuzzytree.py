@@ -25,7 +25,7 @@ pd.set_option('display.colheader_justify', 'center')
 # ==============================================================================
 # --- 1. CONFIGURATION ---
 # ==============================================================================
-AVERAGE_TRIALS_PER_VISIT = False
+AVERAGE_TRIALS_PER_VISIT = True
 type_of_analysis = "average" if AVERAGE_TRIALS_PER_VISIT else "all_visit"
 
 ALGOS_A_TESTER = ['GMM', 'KMEANS', 'HAC']
@@ -33,13 +33,23 @@ ALGOS_A_TESTER = ['GMM', 'KMEANS', 'HAC']
 DEFAULT_FPS = 50
 CUTOFF_FREQ = 3
 
-FEATURES_BASE = ['Knee', 'Tibia', 'Trunk', 'Knee_Frontal']
+# --- CHOIX DE LA MÉTHODE PROM (Z-score, Soucie ou Papageorgiou) ---
+METHODE_PROM = 'Soucie'
+
+# ---> NOUVEAU : CHOIX DE LA SYNCHRONISATION <---
+# True = Tronc et Tibia pris au moment du maximum du Genou (At_Max)
+# False = Tronc et Tibia pris à leur propre maximum absolu (Max)
+SYNC_WITH_KNEE_MAX = False
+# -----------------------------------------------
+
+# --- DÉFINITION DES VARIABLES DE CLUSTERING ---
+FEATURES_BASE = ['Knee', 'Tibia', 'Trunk', 'Knee_Frontal_Dynamic']
 
 FEATURE_MAPPING_MAX = {
     'Knee': 'Knee_Flexion_Max',
-    'Trunk': 'Trunk_Lean_Max',
-    'Tibia': 'Tibia_Lean_Max',
-    'Knee_Frontal': 'Knee_Frontal_Max'
+    'Trunk': 'Trunk_Lean_At_Max' if SYNC_WITH_KNEE_MAX else 'Trunk_Lean_Max',
+    'Tibia': 'Tibia_Lean_At_Max' if SYNC_WITH_KNEE_MAX else 'Tibia_Lean_Max',
+    'Knee_Frontal_Dynamic': 'Knee_Frontal_Delta'
 }
 
 FEATURES_MAX = [FEATURE_MAPPING_MAX[f] for f in FEATURES_BASE]
@@ -48,7 +58,6 @@ FEATURES_MAX = [FEATURE_MAPPING_MAX[f] for f in FEATURES_BASE]
 main_path = r"C:\Users\bourgema\OneDrive - Université de Genève\PHD\Part1"
 master_db_patient_file = fr"{main_path}\Data\Master_Database_Patient_all.pkl"
 frontal_db_patient_file = fr"{main_path}\Data\Master_Database_Patient_Frontal_all.pkl"
-master_db_healthy_file = fr"{main_path}\Data\Master_Database_Healthy_all.pkl"
 features_str = "_".join(FEATURES_BASE)
 
 
@@ -60,14 +69,12 @@ def simplifier_diagnostic(diag):
     d = str(diag).strip().lower().replace(' ', '').replace('é', 'e')
     return 'Hemi' if 'hemi' in d else ('Di' if 'di' in d else 'Autre')
 
-
 def clean_side(cote):
     c = str(cote).lower()
     has_right = 'droit' in c or 'right' in c
     has_left = 'gauch' in c or 'left' in c
     if has_right and has_left:
-        return 'Right > Left' if c.find('droit') < c.find('gauch') or c.find('right') < c.find(
-            'left') else 'Left > Right'
+        return 'Right > Left' if c.find('droit') < c.find('gauch') or c.find('right') < c.find('left') else 'Left > Right'
     elif has_right:
         return 'Right'
     elif has_left:
@@ -75,15 +82,12 @@ def clean_side(cote):
     else:
         return 'Unknown'
 
-
-def process_kinematics_max(curve, fps):
+def get_filtered_curve(curve, fps):
     c_array = np.array(curve)
     valid = ~np.isnan(c_array)
-    if not valid.any(): return np.nan
+    if not valid.any(): return None
     c_interp = np.interp(np.arange(len(c_array)), np.where(valid)[0], c_array[valid])
-    c_filt = butter_lowpass_filter(c_interp, CUTOFF_FREQ, fps)
-    return np.max(c_filt)
-
+    return butter_lowpass_filter(c_interp, CUTOFF_FREQ, fps)
 
 def calculate_valgus_varus_frontal(hip, knee, ankle, side):
     v1 = np.array([knee[0] - hip[0], knee[1] - hip[1]])
@@ -94,17 +98,11 @@ def calculate_valgus_varus_frontal(hip, knee, ankle, side):
     if side == 'gauche': angle_deg = -angle_deg
     return angle_deg
 
-
 def get_clustering_model(algo_name, k):
-    if algo_name == 'GMM':
-        return GaussianMixture(n_components=k, covariance_type='full', random_state=42, n_init=5)
-    elif algo_name == 'KMEANS':
-        return KMeans(n_clusters=k, random_state=42, n_init=10)
-    elif algo_name == 'HAC':
-        return AgglomerativeClustering(n_clusters=k)
-    else:
-        raise ValueError(f"Algorithme {algo_name} non reconnu.")
-
+    if algo_name == 'GMM': return GaussianMixture(n_components=k, covariance_type='full', random_state=42, n_init=5)
+    elif algo_name == 'KMEANS': return KMeans(n_clusters=k, random_state=42, n_init=10)
+    elif algo_name == 'HAC': return AgglomerativeClustering(n_clusters=k)
+    else: raise ValueError(f"Algorithme {algo_name} non reconnu.")
 
 def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID', current_depth=5):
     X = df_tree[variables_cliniques].copy()
@@ -117,13 +115,12 @@ def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'
             colonnes_a_garder.append(col)
 
     X = X[colonnes_a_garder]
-    if X.empty: return 0.0, 0.0, 0.0, None
+    if X.empty: return 0.0, 0.0, 0.0, None, [], []
 
     comptage = y.value_counts()
     min_class_count = comptage.min()
 
-    tree_model = DecisionTreeClassifier(max_depth=current_depth, min_samples_leaf=3, criterion='entropy',
-                                        random_state=42)
+    tree_model = DecisionTreeClassifier(max_depth=current_depth, min_samples_leaf=3, criterion='entropy', random_state=42)
     n_splits = 5
 
     if min_class_count >= n_splits:
@@ -132,6 +129,7 @@ def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'
         cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     acc_scores, sens_scores, spec_scores = [], [], []
+    sens_matrix, spec_matrix = [], []
 
     for train_idx, test_idx in cv.split(X, y):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -156,8 +154,14 @@ def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'
         sens_scores.append(np.mean(sens_par_classe))
         spec_scores.append(np.mean(spec_par_classe))
 
+        sens_matrix.append(sens_par_classe)
+        spec_matrix.append(spec_par_classe)
+
     tree_model.fit(X, y)
-    return np.mean(acc_scores), np.mean(sens_scores), np.mean(spec_scores), tree_model
+    mean_sens_per_class = np.mean(sens_matrix, axis=0)
+    mean_spec_per_class = np.mean(spec_matrix, axis=0)
+
+    return np.mean(acc_scores), np.mean(sens_scores), np.mean(spec_scores), tree_model, mean_sens_per_class, mean_spec_per_class
 
 
 # ==============================================================================
@@ -166,6 +170,15 @@ def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'
 print(f"1. Chargement et extraction unifiée depuis les matrices 3D (Sagittal + Frontal)...")
 
 df_master_pat = pd.read_pickle(master_db_patient_file)
+
+# --- FILTRAGE DES COLONNES pROM ---
+prom_cols = [c for c in df_master_pat.columns if 'pROM_' in c]
+cols_to_drop = [c for c in prom_cols if METHODE_PROM not in c]
+df_master_pat = df_master_pat.drop(columns=cols_to_drop)
+
+rename_dict = {c: c.replace(f"_{METHODE_PROM}", "") for c in df_master_pat.columns if 'pROM_' in c and METHODE_PROM in c}
+df_master_pat = df_master_pat.rename(columns=rename_dict)
+print(f"   -> Méthode pROM sélectionnée : {METHODE_PROM} ({len(cols_to_drop)} colonnes redondantes supprimées)")
 
 if os.path.exists(frontal_db_patient_file):
     df_fro = pd.read_pickle(frontal_db_patient_file)[['File_Sagittal', 'Video_FPS', 'Raw_Keypoints']]
@@ -194,32 +207,47 @@ for idx, row in df_base_pat.iterrows():
         tr_f = [calculate_lean_0_is_straight(kpts[f, 6], kpts[f, 12]) for f in range(n_frames)]
         tib_f = [calculate_lean_0_is_straight(kpts[f, 14], kpts[f, 16]) for f in range(n_frames)]
 
-        k_max = process_kinematics_max(k_f, fps)
-        tr_max = process_kinematics_max(tr_f, fps)
-        tib_max = process_kinematics_max(tib_f, fps)
-        kf_max = np.nan
+        k_filt = get_filtered_curve(k_f, fps)
+        tr_filt = get_filtered_curve(tr_f, fps)
+        tib_filt = get_filtered_curve(tib_f, fps)
 
-        if 'Keypoints_frontal' in row and isinstance(row['Keypoints_frontal'], np.ndarray):
-            kpts_fro = row['Keypoints_frontal']
-            fps_fro = row['FPS_frontal'] if pd.notna(row['FPS_frontal']) and row['FPS_frontal'] > 0 else DEFAULT_FPS
-            n_frames_fro = kpts_fro.shape[0]
+        k_max, tr_at_max, tib_at_max, tr_abs_max, tib_abs_max, kf_max, kf_delta = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
 
-            c_interp = np.interp(np.arange(len(k_f)), np.where(~np.isnan(k_f))[0], np.array(k_f)[~np.isnan(k_f)])
-            c_filt = butter_lowpass_filter(c_interp, CUTOFF_FREQ, fps)
-            idx_sagittal = np.argmax(c_filt)
+        if k_filt is not None:
+            idx_sagittal = np.argmax(k_filt)
+            k_max = k_filt[idx_sagittal]
 
-            time_seconds = idx_sagittal / fps
-            idx_frontal = int(round(time_seconds * fps_fro))
-            idx_frontal = min(max(idx_frontal, 0), n_frames_fro - 1)
+            # --- NOUVEAU : Récupération à la fois du Synchronisé et du Absolu ---
+            if tr_filt is not None:
+                tr_at_max = tr_filt[idx_sagittal]
+                tr_abs_max = np.max(tr_filt)
+            if tib_filt is not None:
+                tib_at_max = tib_filt[idx_sagittal]
+                tib_abs_max = np.max(tib_filt)
 
-            kf_max = calculate_valgus_varus_frontal(kpts_fro[idx_frontal, 12], kpts_fro[idx_frontal, 14],
-                                                    kpts_fro[idx_frontal, 16], 'droite')
+            if 'Keypoints_frontal' in row and isinstance(row['Keypoints_frontal'], np.ndarray):
+                kpts_fro = row['Keypoints_frontal']
+                fps_fro = row['FPS_frontal'] if pd.notna(row['FPS_frontal']) and row['FPS_frontal'] > 0 else DEFAULT_FPS
+                n_frames_fro = kpts_fro.shape[0]
+
+                time_seconds = idx_sagittal / fps
+                idx_frontal = int(round(time_seconds * fps_fro))
+                idx_frontal = min(max(idx_frontal, 0), n_frames_fro - 1)
+
+                kf_start = calculate_valgus_varus_frontal(kpts_fro[0, 12], kpts_fro[0, 14], kpts_fro[0, 16], 'droite')
+                kf_max = calculate_valgus_varus_frontal(kpts_fro[idx_frontal, 12], kpts_fro[idx_frontal, 14], kpts_fro[idx_frontal, 16], 'droite')
+                kf_delta = kf_max - kf_start
 
         entry = {'ID_Patient': row['ID_Patient'], 'ID_Visite': row['ID_Visite'], 'File_Sagittal': row['File_Sagittal'],
                  'Diagnostic': row['Diagnostic'], 'Diag_Lateralite': row.get('Diag_Lateralite', 'Autre / Inconnu'),
                  'Scores_GMFCS': row.get('Scores_GMFCS', np.nan),
-                 'Knee_Flexion_Max': k_max, 'Trunk_Lean_Max': tr_max, 'Tibia_Lean_Max': tib_max,
-                 'Knee_Frontal_Max': kf_max}
+                 'Knee_Flexion_Max': k_max,
+                 'Trunk_Lean_At_Max': tr_at_max,
+                 'Tibia_Lean_At_Max': tib_at_max,
+                 'Trunk_Lean_Max': tr_abs_max,  # Ajout
+                 'Tibia_Lean_Max': tib_abs_max, # Ajout
+                 'Knee_Frontal_Max': kf_max,
+                 'Knee_Frontal_Delta': kf_delta}
 
         for col in df_base_pat.columns:
             if col.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_')):
@@ -234,8 +262,7 @@ df_pat_processed = pd.DataFrame(processed_pat)
 # --- 4. AGGRÉGATION & ALIGNEMENT ---
 # ==============================================================================
 if AVERAGE_TRIALS_PER_VISIT:
-    clin_cols = [c for c in df_pat_processed.columns if
-                 c.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_'))]
+    clin_cols = [c for c in df_pat_processed.columns if c.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_'))]
     agg_dict = {f: 'mean' for f in FEATURES_MAX}
     agg_dict.update({c: 'mean' for c in clin_cols})
     agg_dict.update({'Scores_GMFCS': 'first', 'Diag_Lateralite': 'first'})
@@ -254,9 +281,8 @@ combinaisons_cinematiques = []
 for r in range(1, len(toutes_variables_cinematiques) + 1):
     combinaisons_cinematiques.extend(list(combinations(toutes_variables_cinematiques, r)))
 
-all_clinical_cols = [c for c in df_pat_final.columns if
-                     c.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_')) and not c.endswith(
-                         'G')]
+all_clinical_cols = [c for c in df_pat_final.columns if c.startswith(('Force_', 'ROM_', 'Spastic_', 'Score_')) and not c.endswith('G')]
+
 cols_scores = [c for c in all_clinical_cols if 'Score' in c]
 cols_autres = [c for c in all_clinical_cols if 'Score' not in c]
 
@@ -267,7 +293,9 @@ for current_algo in ALGOS_A_TESTER:
     print(f"🚀 LANCEMENT DU PIPELINE POUR L'ALGORITHME : {current_algo}")
     print(f"{'=' * 60}")
 
-    output_plot_folder = fr"{main_path}\Results_v5\Plot_{current_algo}_right_{type_of_analysis}"
+    # --- NOUVEAU : Différenciation du nom du dossier d'export ---
+    sync_suffix = "SyncKnee" if SYNC_WITH_KNEE_MAX else "AbsMax"
+    output_plot_folder = fr"{main_path}\Results_v52\Plot_{current_algo}_{type_of_analysis}_{sync_suffix}"
     os.makedirs(output_plot_folder, exist_ok=True)
 
     resultats_pipeline = []
@@ -286,7 +314,6 @@ for current_algo in ALGOS_A_TESTER:
             model = get_clustering_model(current_algo, k)
             df_temp['Cluster_ID'] = model.fit_predict(X_kin_scaled)
 
-            # --- FILTRE 1 : MINIMUM 10 PATIENTS PAR CLUSTER ---
             df_temp['Patient_Visit'] = df_temp['ID_Patient'].astype(str) + "_" + df_temp['ID_Visite'].astype(str)
             repartition_list = []
             cluster_valide = True
@@ -295,8 +322,7 @@ for current_algo in ALGOS_A_TESTER:
                 sub = df_temp[df_temp['Cluster_ID'] == c_id]
                 n_pat = sub['ID_Patient'].nunique()
 
-                if n_pat < 10:
-                    cluster_valide = False
+                if n_pat < 8: cluster_valide = False
 
                 n_vis = sub['Patient_Visit'].nunique()
                 n_ess = len(sub)
@@ -305,52 +331,57 @@ for current_algo in ALGOS_A_TESTER:
             repartition_str = " | ".join(repartition_list)
 
             if not cluster_valide:
-                print(
-                    f"[{current_algo}] Rejeté (Cinématique: {kin_vars_list} | k={k}) -> Un cluster a moins de 10 patients.")
+                print(f"[{current_algo}] Rejeté (Cinématique: {kin_vars_list} | k={k}) -> Un cluster a moins de 8 patients.")
                 test_actuel += len(depth_range)
                 continue
-            # ------------------------------------------------
 
-            df_tree_base = df_temp.sort_values(by=['ID_Patient', 'ID_Visite']).drop_duplicates(subset=['ID_Patient'],
-                                                                                               keep='first')
+            df_tree_base = df_temp.sort_values(by=['ID_Patient', 'ID_Visite']).drop_duplicates(subset=['ID_Patient'], keep='first')
 
+            majority_baseline = df_tree_base['Cluster_ID'].value_counts().max() / len(df_tree_base)
             best_acc_for_current_setup = -1
 
             for depth in depth_range:
-                acc_scores, sens_scores, spec_scores, _ = evaluate_tree_silently(df_tree_base, cols_scores,
-                                                                                 target_col='Cluster_ID',
-                                                                                 current_depth=depth)
-                acc_autres, sens_autres, spec_autres, _ = evaluate_tree_silently(df_tree_base, cols_autres,
-                                                                                 target_col='Cluster_ID',
-                                                                                 current_depth=depth)
+                acc_scores, sens_scores, spec_scores, _, sens_pc_scores, spec_pc_scores = evaluate_tree_silently(
+                    df_tree_base, cols_scores, target_col='Cluster_ID', current_depth=depth)
+                acc_autres, sens_autres, spec_autres, _, sens_pc_autres, spec_pc_autres = evaluate_tree_silently(
+                    df_tree_base, cols_autres, target_col='Cluster_ID', current_depth=depth)
 
                 max_acc = max(acc_scores, acc_autres)
-
-                # --- FILTRE 2 : HASARD DE BASE ---
-                seuil_hasard = (1.0 / k) + 0.05  # Le hasard pur + une marge de tolérance de 5%
-                if max_acc <= seuil_hasard:
-                    print(
-                        f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}% (Ignoré : Résultat inférieur ou égal au hasard)")
-                    test_actuel += 1
-                    continue
-                # ---------------------------------
-
-                # --- FILTRE 3 : PROFONDEUR UTILE ---
-                if max_acc <= best_acc_for_current_setup + 0.001:
-                    print(
-                        f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}% (Ignoré : N'améliore pas l'arbre plus petit)")
-                    test_actuel += 1
-                    continue
-
-                best_acc_for_current_setup = max_acc
-                # -----------------------------------
 
                 if acc_scores > acc_autres:
                     type_gagnant = "Scores"
                     best_sens, best_spec = sens_scores, spec_scores
+                    best_sens_pc, best_spec_pc = sens_pc_scores, spec_pc_scores
                 else:
                     type_gagnant = "Clinique (Autre)"
                     best_sens, best_spec = sens_autres, spec_autres
+                    best_sens_pc, best_spec_pc = sens_pc_autres, spec_pc_autres
+
+                if max_acc <= majority_baseline + 0.02:
+                    print(f"[{current_algo}] Rejeté (Ciném: {kin_vars_list} | k={k} | depth={depth}) -> Acc ({max_acc * 100:.1f}%) <= Baseline Majoritaire ({majority_baseline * 100:.1f}%)")
+                    test_actuel += 1
+                    continue
+
+                seuil_global = 0.55
+                seuil_groupe = 0.50
+
+                min_sens_cluster = np.min(best_sens_pc)
+                min_spec_cluster = np.min(best_spec_pc)
+
+                if best_sens < seuil_global or best_spec < seuil_global or min_sens_cluster < seuil_groupe or min_spec_cluster < seuil_groupe:
+                    print(f"[{current_algo}] Rejeté (Ciném: {kin_vars_list} | k={k} | depth={depth}) -> Qualité insuffisante (Sens Moy: {best_sens * 100:.1f}%, Min groupe: {min_sens_cluster * 100:.1f}%)")
+                    test_actuel += 1
+                    continue
+
+                if max_acc <= best_acc_for_current_setup + 0.001:
+                    print(f"[{current_algo}] Rejeté (Ciném: {kin_vars_list} | k={k} | depth={depth}) -> N'améliore pas l'arbre plus petit")
+                    test_actuel += 1
+                    continue
+
+                best_acc_for_current_setup = max_acc
+
+                sens_str = " | ".join([f"C{i}: {val * 100:.1f}%" for i, val in enumerate(best_sens_pc)])
+                spec_str = " | ".join([f"C{i}: {val * 100:.1f}%" for i, val in enumerate(best_spec_pc)])
 
                 resultats_pipeline.append({
                     'Algorithme': current_algo,
@@ -358,9 +389,11 @@ for current_algo in ALGOS_A_TESTER:
                     'Nb_Clusters': k,
                     'Profondeur_Arbre': depth,
                     'Max_Accuracy': max_acc,
-                    'Sensibilite': best_sens,
-                    'Specificite': best_spec,
-                    'Baseline_Hasard': round(1.0 / k, 2),  # Ajout dans le Excel pour traçabilité
+                    'Sensibilite_Moyenne': best_sens,
+                    'Specificite_Moyenne': best_spec,
+                    'Détails_Sensibilité': sens_str,
+                    'Détails_Spécificité': spec_str,
+                    'Baseline_Majoritaire': round(majority_baseline, 3),
                     'Meilleur_Predictif': type_gagnant,
                     'Détails_Clusters (Pat/Vis/Essais)': repartition_str
                 })
@@ -376,29 +409,25 @@ for current_algo in ALGOS_A_TESTER:
                         'Dataframe': df_tree_base.copy()
                     }
 
-                print(
-                    f"[{current_algo}] Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}%")
+                print(f"[{current_algo}] ✅ VALIDÉ Test {test_actuel}/{total_tests} | Cinématique: {kin_vars_list} | k={k} | depth={depth} -> Max Acc: {max_acc * 100:.1f}%")
                 test_actuel += 1
 
     # --- AFFICHAGE ET SAUVEGARDE POUR L'ALGORITHME EN COURS ---
     if not resultats_pipeline:
-        print(f"⚠️ Aucun résultat valide trouvé pour {current_algo} (clusters < 10 patients ou arbres = hasard).")
+        print(f"⚠️ Aucun résultat valide n'a survécu aux filtres cliniques stricts pour {current_algo}.")
         continue
 
     df_resultats = pd.DataFrame(resultats_pipeline).sort_values(by='Max_Accuracy', ascending=False)
     print("\n" + "-" * 50)
-    print(f"🏆 TOP 3 - {current_algo}")
+    print(f"🏆 TOP 3 DES RÉSULTATS ROBUSTES - {current_algo}")
     print("-" * 50)
-    print(df_resultats[
-              ['Variables_Cinematiques', 'Nb_Clusters', 'Profondeur_Arbre', 'Max_Accuracy', 'Meilleur_Predictif']].head(
-        3).to_string(index=False))
+    print(df_resultats[['Variables_Cinematiques', 'Nb_Clusters', 'Profondeur_Arbre', 'Max_Accuracy', 'Sensibilite_Moyenne']].head(3).to_string(index=False))
 
     df_best = meilleure_configuration['Dataframe']
     best_vars_cliniques = meilleure_configuration['Variables_X']
     best_depth = meilleure_configuration['Profondeur_Arbre']
 
-    _, _, _, best_tree_model = evaluate_tree_silently(df_best, best_vars_cliniques, target_col='Cluster_ID',
-                                                      current_depth=best_depth)
+    _, _, _, best_tree_model, _, _ = evaluate_tree_silently(df_best, best_vars_cliniques, target_col='Cluster_ID', current_depth=best_depth)
 
     X_best = df_best[best_vars_cliniques].copy()
     cols_valides = [c for c in best_vars_cliniques if X_best[c].isna().mean() <= 0.3]
@@ -413,14 +442,12 @@ for current_algo in ALGOS_A_TESTER:
               rounded=True,
               fontsize=9)
 
-    plt.title(
-        f"Meilleur Arbre ({current_algo}) - Acc: {meilleur_score_global * 100:.1f}% | Clusters: {meilleure_configuration['Nb_Clusters']} | Profondeur: {best_depth}\nVariables: {meilleure_configuration['Variables_Cinematiques']}",
-        fontsize=16, fontweight='bold')
+    plt.title(f"Meilleur Arbre Robuste ({current_algo}) - Acc: {meilleur_score_global * 100:.1f}% | Clusters: {meilleure_configuration['Nb_Clusters']} | Prof: {best_depth}\nVariables: {meilleure_configuration['Variables_Cinematiques']}", fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(os.path.join(output_plot_folder, f"Best_Decision_Tree_{current_algo}.png"), dpi=300)
+    plt.savefig(os.path.join(output_plot_folder, f"Best_Decision_Tree_Robust_{current_algo}.png"), dpi=300)
     plt.close()
 
-    df_resultats.to_excel(os.path.join(output_plot_folder, f"Resultats_Pipeline_{current_algo}.xlsx"), index=False)
+    df_resultats.to_excel(os.path.join(output_plot_folder, f"Resultats_Pipeline_Robust_{current_algo}.xlsx"), index=False)
     print(f"✅ Résultats sauvegardés dans :\n{output_plot_folder}\n")
 
 print("\n🎉 ANALYSE MULTI-ALGORITHMES TERMINÉE AVEC SUCCÈS ! 🎉")
