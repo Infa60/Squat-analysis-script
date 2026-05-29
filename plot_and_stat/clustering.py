@@ -29,19 +29,19 @@ pd.set_option('display.colheader_justify', 'center')
 # ==============================================================================
 # --- 1. CONFIGURATION ---
 # ==============================================================================
-AVERAGE_TRIALS_PER_VISIT = False  # Mode d'agrégation clinique (Script 2)
+AVERAGE_TRIALS_PER_VISIT = True  # Mode d'agrégation clinique (Script 2)
 type_of_analysis = "average" if AVERAGE_TRIALS_PER_VISIT else "all_visit"
 
 CLUSTERING_MODE = 'MAX'  # 'MAX', 'CURVE', ou 'BOTH'
-ALGO_CLUSTERING = 'KMEANS'  # Options : 'HAC', 'GMM', 'KMEANS'
-NUM_CLUSTERS = 3
+ALGO_CLUSTERING = 'HAC'  # Options : 'HAC', 'GMM', 'KMEANS'
+NUM_CLUSTERS = 2
 DEFAULT_FPS = 50
 CUTOFF_FREQ = 3
 POINTS_NORMALISATION = 101
 
 # --- DÉFINITION DES VARIABLES DE CLUSTERING (Script 1 - Mapping dynamique) ---
 # Vous pouvez ajouter 'Knee_Frontal' dans FEATURES_BASE si vous voulez l'inclure dans le clustering
-FEATURES_BASE = ['Knee', 'Trunk']
+FEATURES_BASE = ['Tibia']
 
 FEATURE_MAPPING = {
     'Knee': ('Knee_Flexion_Max', 'Knee_Curve'),
@@ -375,6 +375,8 @@ for idx, row in df_base_pat.iterrows():
         tr_curve, tr_max = process_kinematics(tr_f, fps)
         tib_curve, tib_max = process_kinematics(tib_f, fps)
 
+        # tib_max = k_max - tib_max
+
         kf_max = np.nan
         kf_curve = np.full(POINTS_NORMALISATION, np.nan)
 
@@ -431,6 +433,8 @@ for idx, row in df_master_health.iterrows():
         tr_curve, tr_max = process_kinematics(tr_f, fps)
         tib_curve, tib_max = process_kinematics(tib_f, fps)
 
+        # tib_max = k_max - tib_max
+
         kf_curve, kf_max = np.full(POINTS_NORMALISATION, np.nan), np.nan
 
         processed_health.append({
@@ -475,13 +479,51 @@ if CLUSTERING_MODE == 'BOTH':
 # ==============================================================================
 if CLUSTERING_MODE in ['MAX', 'BOTH'] and not df_max_pat.empty:
     print("\n--- CLUSTERING SUR VALEURS MAXIMALES ---")
+
     X_max_scaled = StandardScaler().fit_transform(df_max_pat[FEATURES_MAX])
-    df_max_pat['Cluster_Max'] = get_clustering_model(ALGO_CLUSTERING, NUM_CLUSTERS).fit_predict(X_max_scaled)
+
+    if ALGO_CLUSTERING == 'GMM':
+        bics = []
+        k_range = range(2, 7)  # Tester entre 2 et 6 clusters
+        for k in k_range:
+            gmm = GaussianMixture(n_components=k, random_state=42, n_init=10)
+            gmm.fit(X_max_scaled)
+            bics.append(gmm.bic(X_max_scaled))
+
+        # Le meilleur k est celui qui minimise le BIC
+        best_k = k_range[np.argmin(bics)]
+        print(f"Le nombre optimal de clusters selon le BIC est : {best_k}")
+
+        num_clusters_active = best_k
+
+    else:
+        num_clusters_active = NUM_CLUSTERS
+
+    model_final = get_clustering_model(ALGO_CLUSTERING, num_clusters_active)
+
+    # Clustering "dur" (Assignation au cluster dominant)
+    df_max_pat['Cluster_Max'] = model_final.fit_predict(X_max_scaled)
     df_max_pat['Profile_Max_Label'] = df_max_pat['Cluster_Max'].apply(lambda x: f"Max_Prof_{x + 1}")
+
+    # --- NOUVEAU CODE : EXTRACTION DES PROBABILITÉS (POURCENTAGES) ---
+    if ALGO_CLUSTERING == 'GMM':
+        # predict_proba renvoie une matrice de taille (n_patients, n_clusters)
+        matrice_probabilites = model_final.predict_proba(X_max_scaled)
+
+        # On boucle sur le nombre de clusters pour créer une colonne par cluster
+        for i in range(num_clusters_active):
+            # On multiplie par 100 pour avoir un pourcentage lisible (ex: 85.5%)
+            nom_colonne = f"Proba_Prof_{i + 1}_(%)"
+            df_max_pat[nom_colonne] = np.round(matrice_probabilites[:, i] * 100, 2)
+
+        print("\nAperçu des probabilités d'appartenance :")
+        colonnes_a_afficher = ['ID_Patient', 'Profile_Max_Label'] + [f"Proba_Prof_{i + 1}_(%)" for i in
+                                                                     range(num_clusters_active)]
+        print(df_max_pat[colonnes_a_afficher].head())
 
     prof_counts = df_max_pat['Profile_Max_Label'].value_counts().to_dict()
     df_max_pat['Profile_Max_Label'] = df_max_pat['Profile_Max_Label'].apply(lambda x: f"{x} (n={prof_counts[x]})")
-    pal_max = {f"Max_Prof_{i + 1} (n={prof_counts.get(f'Max_Prof_{i + 1}', 0)})": sns.color_palette("Set2", NUM_CLUSTERS)[i] for i in range(NUM_CLUSTERS)}
+    pal_max = {f"Max_Prof_{i + 1} (n={prof_counts.get(f'Max_Prof_{i + 1}', 0)})": sns.color_palette("Set2", num_clusters_active)[i] for i in range(num_clusters_active)}
     pal_max.update({"Healthy Ref": "grey"})
 
     df_plot_max = pd.concat([df_max_pat, df_healthy_max], ignore_index=True)
@@ -545,7 +587,7 @@ if CLUSTERING_MODE in ['CURVE', 'BOTH'] and not df_curve_pat_agg.empty:
                     axes_c[i].fill_between(time_vec, m_h - s_h, m_h + s_h, color='grey', alpha=0.1)
 
         for i, ax in enumerate(axes_c): ax.set_title(FEATURES_CURVE[i].replace('_Curve', ' Mean Curve'), fontweight='bold')
-        fig_c.legend(loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=NUM_CLUSTERS, frameon=True)
+        fig_c.legend(loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=num_clusters_active, frameon=True)
         plt.tight_layout()
         plt.savefig(os.path.join(output_plot_folder, "Curve_TimeSeries_MeanPlot.png"), dpi=300, bbox_inches='tight')
         plt.close()
@@ -610,7 +652,7 @@ if not df_labels_curve.empty:
     df_export = pd.merge(df_export, df_labels_curve, on=merge_keys, how='left')
 
 # 5. Sauvegarde du nouveau fichier pickle
-export_file_name = f"Master_Database_Patient_Clustered_{ALGO_CLUSTERING}_{NUM_CLUSTERS}_{type_of_analysis}.pkl"
+export_file_name = f"Master_Database_Patient_Clustered_{ALGO_CLUSTERING}_{num_clusters_active}_{type_of_analysis}.pkl"
 export_path = os.path.join(main_path, "Data", export_file_name)
 
 df_export.to_pickle(export_path)

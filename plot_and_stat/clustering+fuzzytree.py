@@ -25,8 +25,12 @@ pd.set_option('display.colheader_justify', 'center')
 # ==============================================================================
 # --- 1. CONFIGURATION ---
 # ==============================================================================
-AVERAGE_TRIALS_PER_VISIT = True
-type_of_analysis = "average" if AVERAGE_TRIALS_PER_VISIT else "all_visit"
+
+# ---> NOUVEAU : CHOIX DE L'AGRÉGATION DES ESSAIS <---
+# Options : 'mean' (moyenne), 'median' (médiane), 'max_flexion' (le meilleur essai), 'none' (tous les essais)
+AGGREGATION_METHOD = 'mean'
+type_of_analysis = AGGREGATION_METHOD
+# ----------------------------------------------------
 
 ALGOS_A_TESTER = ['GMM', 'KMEANS', 'HAC']
 
@@ -36,7 +40,7 @@ CUTOFF_FREQ = 3
 # --- CHOIX DE LA MÉTHODE PROM (Z-score, Soucie ou Papageorgiou) ---
 METHODE_PROM = 'Soucie'
 
-# ---> NOUVEAU : CHOIX DE LA SYNCHRONISATION <---
+# ---> CHOIX DE LA SYNCHRONISATION <---
 # True = Tronc et Tibia pris au moment du maximum du Genou (At_Max)
 # False = Tronc et Tibia pris à leur propre maximum absolu (Max)
 SYNC_WITH_KNEE_MAX = False
@@ -164,6 +168,26 @@ def evaluate_tree_silently(df_tree, variables_cliniques, target_col='Cluster_ID'
     return np.mean(acc_scores), np.mean(sens_scores), np.mean(spec_scores), tree_model, mean_sens_per_class, mean_spec_per_class
 
 
+def categorize_clinical_variable(series):
+    """
+    Reproduit la logique de l'article de S. Armand et al.
+    Convertit une variable continue en 3 classes (0: Low, 1: Average, 2: High)
+    basé sur la distribution de la cohorte.
+    """
+    p5 = series.quantile(0.05)
+    median = series.median()
+    p95 = series.quantile(0.95)
+
+    # Pour simplifier la logique floue en logique discrète (Crisp) compatible avec scikit-learn :
+    conditions = [
+        (series <= (p5 + median) / 2),
+        (series > (p5 + median) / 2) & (series <= (median + p95) / 2),
+        (series > (median + p95) / 2)
+    ]
+    choices = [0, 1, 2]  # 0: Low, 1: Average, 2: High
+    return pd.Series(np.select(conditions, choices, default=np.nan), index=series.index)
+
+
 # ==============================================================================
 # --- 3. CHARGEMENT ET PRÉPARATION UNIFIÉE ---
 # ==============================================================================
@@ -217,7 +241,6 @@ for idx, row in df_base_pat.iterrows():
             idx_sagittal = np.argmax(k_filt)
             k_max = k_filt[idx_sagittal]
 
-            # --- NOUVEAU : Récupération à la fois du Synchronisé et du Absolu ---
             if tr_filt is not None:
                 tr_at_max = tr_filt[idx_sagittal]
                 tr_abs_max = np.max(tr_filt)
@@ -244,8 +267,8 @@ for idx, row in df_base_pat.iterrows():
                  'Knee_Flexion_Max': k_max,
                  'Trunk_Lean_At_Max': tr_at_max,
                  'Tibia_Lean_At_Max': tib_at_max,
-                 'Trunk_Lean_Max': tr_abs_max,  # Ajout
-                 'Tibia_Lean_Max': tib_abs_max, # Ajout
+                 'Trunk_Lean_Max': tr_abs_max,
+                 'Tibia_Lean_Max': tib_abs_max,
                  'Knee_Frontal_Max': kf_max,
                  'Knee_Frontal_Delta': kf_delta}
 
@@ -261,14 +284,25 @@ df_pat_processed = pd.DataFrame(processed_pat)
 # ==============================================================================
 # --- 4. AGGRÉGATION & ALIGNEMENT ---
 # ==============================================================================
-if AVERAGE_TRIALS_PER_VISIT:
+print(f"2. Application de la méthode d'agrégation : {AGGREGATION_METHOD}")
+
+if AGGREGATION_METHOD == 'none':
+    df_pat_final = df_pat_processed.copy()
+
+elif AGGREGATION_METHOD == 'max_flexion':
+    # --- NOUVEAU : On ne garde que l'essai avec le plus grand Knee_Flexion_Max pour chaque visite ---
+    idx_max = df_pat_processed.groupby(['ID_Patient', 'ID_Visite'])['Knee_Flexion_Max'].idxmax()
+    df_pat_final = df_pat_processed.loc[idx_max].reset_index(drop=True)
+
+elif AGGREGATION_METHOD in ['mean', 'median']:
     clin_cols = [c for c in df_pat_processed.columns if c.startswith(('Force_', 'ROM_', 'Spastic_', 'Selectivite_', 'Score_', 'pROM_'))]
-    agg_dict = {f: 'mean' for f in FEATURES_MAX}
-    agg_dict.update({c: 'mean' for c in clin_cols})
+    agg_dict = {f: AGGREGATION_METHOD for f in FEATURES_MAX}
+    agg_dict.update({c: AGGREGATION_METHOD for c in clin_cols})
     agg_dict.update({'Scores_GMFCS': 'first', 'Diag_Lateralite': 'first'})
     df_pat_final = df_pat_processed.groupby(['ID_Patient', 'ID_Visite', 'Diagnostic']).agg(agg_dict).reset_index()
+
 else:
-    df_pat_final = df_pat_processed.copy()
+    raise ValueError(f"Méthode d'agrégation '{AGGREGATION_METHOD}' non reconnue.")
 
 # ==============================================================================
 # --- 5 & 6. PIPELINE AUTOMATISÉ POUR CHAQUE ALGORITHME ---
@@ -286,6 +320,10 @@ all_clinical_cols = [c for c in df_pat_final.columns if c.startswith(('Force_', 
 cols_scores = [c for c in all_clinical_cols if 'Score' in c]
 cols_autres = [c for c in all_clinical_cols if 'Score' not in c]
 
+# Application à toutes vos colonnes cliniques
+for col in cols_autres:
+    df_pat_final[col + '_Fuzzy'] = categorize_clinical_variable(df_pat_final[col])
+
 total_tests = len(combinaisons_cinematiques) * len(k_range) * len(depth_range)
 
 for current_algo in ALGOS_A_TESTER:
@@ -293,9 +331,8 @@ for current_algo in ALGOS_A_TESTER:
     print(f"🚀 LANCEMENT DU PIPELINE POUR L'ALGORITHME : {current_algo}")
     print(f"{'=' * 60}")
 
-    # --- NOUVEAU : Différenciation du nom du dossier d'export ---
     sync_suffix = "SyncKnee" if SYNC_WITH_KNEE_MAX else "AbsMax"
-    output_plot_folder = fr"{main_path}\Results_v52\Plot_{current_algo}_{type_of_analysis}_{sync_suffix}"
+    output_plot_folder = fr"{main_path}\Results_v2\Plot_{current_algo}_{type_of_analysis}_{sync_suffix}"
     os.makedirs(output_plot_folder, exist_ok=True)
 
     resultats_pipeline = []
